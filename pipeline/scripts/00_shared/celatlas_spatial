@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# The upstream executable can retain a shebang to a different environment.
+# Dispatch through the workflow's selected Python so imports are reproducible.
+CELATLAS_PYTHON=${CELATLAS_PYTHON:-python3}
+exec "$CELATLAS_PYTHON" -m celatlas_spatial.celatlas "$@"

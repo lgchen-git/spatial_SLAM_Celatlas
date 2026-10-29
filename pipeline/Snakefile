@@ -1,0 +1,290 @@
+import csv
+from pathlib import Path
+
+
+SAMPLE = config["sample_id"]
+RUN_CONFIG = config["config_path"]
+OUTPUTS = config.get("outputs_root", "outputs")
+LOG_ROOT = config.get("log_root", "log")
+SOURCE_OUTPUTS = config.get("source_outputs_root", OUTPUTS)
+TMP = config.get("tmp_root", "tmp")
+SAMPLES_TSV = config["samples"]
+LIBRARIES_TSV = config["libraries"]
+THREADS = int(config.get("threads", 4))
+MOLECULE_WORKERS = int(config.get("molecule_call_workers", min(THREADS, 8)))
+WORKFLOW_MEMORY_MB = int(config.get("memory_mb", 98304))
+
+
+def tsv_rows(path):
+    with open(path, encoding="utf-8", newline="") as handle:
+        return list(csv.DictReader(handle, delimiter="\t"))
+
+
+sample_row = next(row for row in tsv_rows(SAMPLES_TSV) if row["sample_id"] == SAMPLE)
+library_rows = [row for row in tsv_rows(LIBRARIES_TSV) if row["sample_id"] == SAMPLE]
+FASTQS = [row[key] for row in library_rows for key in ("fastq_r1", "fastq_r2")]
+MASK = sample_row["mask_dir"]
+CHIP = sample_row["chip_id"]
+SAMPLE_ROOT = f"{OUTPUTS}/{SAMPLE}"
+SOURCE_SAMPLE_ROOT = f"{SOURCE_OUTPUTS}/{SAMPLE}"
+CELATLAS_SOURCE = (sample_row.get("celatlas_result_dir") or "").strip()
+CELATLAS_REUSE = bool(CELATLAS_SOURCE)
+CELATLAS = CELATLAS_SOURCE or (
+    f"{SAMPLE_ROOT}/02_celatlas/04_tool_output/celatlas_full/results/{config['project_id']}/{CHIP}"
+)
+RUN_SCOPE = config.get("run_scope", "full")
+SPATIAL_BIN_SIZE = int(config.get("spatial", {}).get("bin_size_raw", 50))
+SPATIAL_BIN_LABEL = f"bin{SPATIAL_BIN_SIZE}"
+CELATLAS_BIN = f"{CELATLAS}/06.segment/01.binsegment/square_bin/{CHIP}_{SPATIAL_BIN_LABEL}"
+SPATIAL_SOURCE_ROOT = SOURCE_SAMPLE_ROOT if RUN_SCOPE == "spatial_report" else SAMPLE_ROOT
+BULK_SOURCE_ROOT = SOURCE_SAMPLE_ROOT if RUN_SCOPE in {"spatial_report", "reviewed"} else SAMPLE_ROOT
+UPSTREAM_SOURCE_ROOT = SOURCE_SAMPLE_ROOT if RUN_SCOPE == "reviewed" else SAMPLE_ROOT
+REPORT_FILENAME = config.get("report_filename", f"{SAMPLE}_report.html")
+
+
+def stage_marker(number, name):
+    return f"{SAMPLE_ROOT}/{number}_{name}/05_metadata/stage_complete.json"
+
+
+if config.get("smoke", False):
+    FINAL_TARGETS = [f"{OUTPUTS}/{SAMPLE}/docker_smoke_complete.json"]
+elif RUN_SCOPE == "spatial_report":
+    FINAL_TARGETS = [
+        stage_marker("07", "spatial_dynamics"),
+        stage_marker("09", "report"),
+        f"{SAMPLE_ROOT}/09_report/{SAMPLE}_report.html",
+        f"{SAMPLE_ROOT}/09_report/05_metadata/report_validation.json",
+    ]
+elif RUN_SCOPE == "reviewed":
+    FINAL_TARGETS = [
+        stage_marker("05", "molecule_call"),
+        stage_marker("06", "matrix"),
+        stage_marker("07", "spatial_dynamics"),
+        stage_marker("09", "report"),
+        f"{SAMPLE_ROOT}/09_report/{REPORT_FILENAME}",
+        f"{SAMPLE_ROOT}/09_report/05_metadata/report_validation.json",
+    ]
+else:
+    FINAL_TARGETS = [stage_marker("01", "input_qc"), stage_marker("02", "celatlas"),
+                     stage_marker("03", "barcode"), stage_marker("04", "trim_align"),
+                     stage_marker("05", "molecule_call"), stage_marker("06", "matrix"),
+                     stage_marker("07", "spatial_dynamics"), stage_marker("08", "tissue_bulk"),
+                     stage_marker("09", "report"), f"{SAMPLE_ROOT}/09_report/{SAMPLE}_report.html",
+                     f"{SAMPLE_ROOT}/09_report/05_metadata/report_validation.json"]
+
+
+rule all:
+    input: FINAL_TARGETS
+
+
+rule input_qc:
+    input:
+        samples=SAMPLES_TSV,
+        libraries=LIBRARIES_TSV,
+        fastqs=FASTQS,
+        barcode=f"{MASK}/{CHIP}.barcodeToPos.h5",
+        whitelist=f"{MASK}/{CHIP}_FilterBarcodes.csv",
+        bbox=f"{MASK}/{CHIP}_tissue_bbox.csv"
+    output:
+        table=f"{SAMPLE_ROOT}/01_input_qc/01_tables/chip_assignment_crosscheck.tsv",
+        qc=f"{SAMPLE_ROOT}/01_input_qc/05_metadata/chip_assignment_qc.json",
+        marker=stage_marker("01", "input_qc")
+    log: f"{LOG_ROOT}/{SAMPLE}/01_input_qc.log"
+    benchmark: f"{LOG_ROOT}/{SAMPLE}/01_input_qc.benchmark.tsv"
+    threads: THREADS
+    resources: mem_mb=16384
+    shell:
+        "python3 pipeline/run_stage.py --config {RUN_CONFIG} --stage 01 > {log} 2>&1"
+
+
+if CELATLAS_REUSE:
+    rule celatlas:
+        input:
+            prior=rules.input_qc.output.marker,
+            metrics=f"{CELATLAS}/.metrics.json",
+            count_detail=f"{CELATLAS}/05.count/{CHIP}_count_detail.txt",
+            matrix=f"{CELATLAS}/06.segment/01.binsegment/square_bin/{CHIP}_bin50/filtered_feature_bc_matrix/matrix.mtx.gz",
+            positions=f"{CELATLAS}/06.segment/01.binsegment/square_bin/{CHIP}_bin50/spatial/tissue_positions_list.csv",
+            report=f"{CELATLAS}/{CHIP}_spatial_analysis_report.html"
+        output:
+            validation=f"{SAMPLE_ROOT}/02_celatlas/05_metadata/celatlas_reuse_validation.json",
+            pointer=f"{SAMPLE_ROOT}/02_celatlas/05_metadata/celatlas_result_dir.txt",
+            marker=stage_marker("02", "celatlas")
+        log: f"{LOG_ROOT}/{SAMPLE}/02_celatlas.log"
+        benchmark: f"{LOG_ROOT}/{SAMPLE}/02_celatlas.benchmark.tsv"
+        threads: 1
+        resources: mem_mb=2048
+        shell:
+            "python3 pipeline/run_stage.py --config {RUN_CONFIG} --stage 02 > {log} 2>&1"
+else:
+    rule celatlas:
+        input:
+            prior=rules.input_qc.output.marker
+        output:
+            validation=f"{SAMPLE_ROOT}/02_celatlas/05_metadata/celatlas_reuse_validation.json",
+            pointer=f"{SAMPLE_ROOT}/02_celatlas/05_metadata/celatlas_result_dir.txt",
+            metrics=f"{CELATLAS}/.metrics.json",
+            count_detail=f"{CELATLAS}/05.count/{CHIP}_count_detail.txt",
+            matrix=f"{CELATLAS}/06.segment/01.binsegment/square_bin/{CHIP}_bin50/filtered_feature_bc_matrix/matrix.mtx.gz",
+            features=f"{CELATLAS}/06.segment/01.binsegment/square_bin/{CHIP}_bin50/filtered_feature_bc_matrix/features.tsv.gz",
+            barcodes=f"{CELATLAS}/06.segment/01.binsegment/square_bin/{CHIP}_bin50/filtered_feature_bc_matrix/barcodes.tsv.gz",
+            positions=f"{CELATLAS}/06.segment/01.binsegment/square_bin/{CHIP}_bin50/spatial/tissue_positions_list.csv",
+            raw_positions=f"{CELATLAS}/06.segment/01.binsegment/square_bin/{CHIP}_Raw/spatial/tissue_positions_list.csv",
+            scalefactors=f"{CELATLAS}/06.segment/01.binsegment/square_bin/{CHIP}_Raw/spatial/scalefactors_json.json",
+            registration_image=f"{CELATLAS}/06.segment/01.binsegment/images/{CHIP}_regist.tif",
+            hires_image=f"{CELATLAS}/06.segment/01.binsegment/images/tissue_hires_image.png",
+            lowres_image=f"{CELATLAS}/06.segment/01.binsegment/images/tissue_lowres_image.png",
+            report=f"{CELATLAS}/{CHIP}_spatial_analysis_report.html",
+            marker=stage_marker("02", "celatlas")
+        log: f"{LOG_ROOT}/{SAMPLE}/02_celatlas.log"
+        benchmark: f"{LOG_ROOT}/{SAMPLE}/02_celatlas.benchmark.tsv"
+        threads: THREADS
+        resources: mem_mb=65536
+        shell:
+            "python3 pipeline/run_stage.py --config {RUN_CONFIG} --stage 02 > {log} 2>&1"
+
+
+rule barcode:
+    input:
+        prior=rules.celatlas.output.marker,
+        fastqs=FASTQS,
+        whitelist=f"{MASK}/{CHIP}_FilterBarcodes.csv"
+    output:
+        table=f"{SAMPLE_ROOT}/03_barcode/01_tables/{SAMPLE}.read_barcode_umi.tsv.gz",
+        filtered=f"{TMP}/{SAMPLE}/03_barcode/{SAMPLE}.filtered_r2.fastq.gz",
+        marker=stage_marker("03", "barcode")
+    log: f"{LOG_ROOT}/{SAMPLE}/03_barcode.log"
+    benchmark: f"{LOG_ROOT}/{SAMPLE}/03_barcode.benchmark.tsv"
+    threads: THREADS
+    resources: mem_mb=32768
+    shell:
+        "python3 pipeline/run_stage.py --config {RUN_CONFIG} --stage 03 > {log} 2>&1"
+
+
+rule smoke_complete:
+    input:
+        marker=rules.barcode.output.marker,
+        table=rules.barcode.output.table,
+        filtered=rules.barcode.output.filtered
+    output: f"{OUTPUTS}/{SAMPLE}/docker_smoke_complete.json"
+    log: f"{LOG_ROOT}/{SAMPLE}/docker_smoke_complete.log"
+    threads: 1
+    resources: mem_mb=1024
+    shell:
+        "python3 pipeline/write_smoke_complete.py --sample {SAMPLE} --barcode-table {input.table} "
+        "--filtered-r2 {input.filtered} --output {output} > {log} 2>&1"
+
+
+rule trim_align:
+    input:
+        prior=rules.barcode.output.marker,
+        filtered=rules.barcode.output.filtered,
+        barcode=rules.barcode.output.table,
+        genome="reference/Genome"
+    output:
+        bam=f"{SAMPLE_ROOT}/04_trim_align/04_tool_output/celatlas/{SAMPLE}_Aligned.sortedByCoord.out.bam",
+        tag_stats=f"{SAMPLE_ROOT}/04_trim_align/05_metadata/qname_tagging.json",
+        marker=stage_marker("04", "trim_align")
+    log: f"{LOG_ROOT}/{SAMPLE}/04_trim_align.log"
+    benchmark: f"{LOG_ROOT}/{SAMPLE}/04_trim_align.benchmark.tsv"
+    threads: THREADS
+    resources: mem_mb=65536
+    shell:
+        "python3 pipeline/run_stage.py --config {RUN_CONFIG} --stage 04 > {log} 2>&1"
+
+
+rule molecule_call:
+    input:
+        prior=f"{UPSTREAM_SOURCE_ROOT}/04_trim_align/05_metadata/stage_complete.json",
+        tag_stats=f"{UPSTREAM_SOURCE_ROOT}/04_trim_align/05_metadata/qname_tagging.json",
+        bam=f"{UPSTREAM_SOURCE_ROOT}/04_trim_align/04_tool_output/celatlas/{SAMPLE}_Aligned.sortedByCoord.out.bam",
+        barcode=f"{UPSTREAM_SOURCE_ROOT}/03_barcode/01_tables/{SAMPLE}.read_barcode_umi.tsv.gz",
+        fasta="reference/genome.fa",
+        gtf="reference/genes.gtf"
+    output:
+        molecules=f"{SAMPLE_ROOT}/05_molecule_call/01_tables/{SAMPLE}.molecule_calls.tsv.gz",
+        marker=stage_marker("05", "molecule_call")
+    log: f"{LOG_ROOT}/{SAMPLE}/05_molecule_call.log"
+    benchmark: f"{LOG_ROOT}/{SAMPLE}/05_molecule_call.benchmark.tsv"
+    threads: MOLECULE_WORKERS
+    resources: mem_mb=65536
+    shell:
+        "python3 pipeline/run_stage.py --config {RUN_CONFIG} --stage 05 > {log} 2>&1"
+
+
+rule matrix:
+    input:
+        prior=rules.molecule_call.output.marker,
+        molecules=rules.molecule_call.output.molecules
+    output:
+        old=f"{SAMPLE_ROOT}/06_matrix/04_tool_output/matrix/old_umi.mtx",
+        new=f"{SAMPLE_ROOT}/06_matrix/04_tool_output/matrix/new_umi.mtx",
+        features=f"{SAMPLE_ROOT}/06_matrix/04_tool_output/matrix/features.tsv",
+        barcodes=f"{SAMPLE_ROOT}/06_matrix/04_tool_output/matrix/barcodes.tsv",
+        marker=stage_marker("06", "matrix")
+    log: f"{LOG_ROOT}/{SAMPLE}/06_matrix.log"
+    benchmark: f"{LOG_ROOT}/{SAMPLE}/06_matrix.benchmark.tsv"
+    threads: 1
+    resources: mem_mb=32768
+    shell:
+        "python3 pipeline/run_stage.py --config {RUN_CONFIG} --stage 06 > {log} 2>&1"
+
+
+rule spatial_dynamics:
+    input:
+        prior=f"{SPATIAL_SOURCE_ROOT}/06_matrix/05_metadata/stage_complete.json",
+        old=f"{SPATIAL_SOURCE_ROOT}/06_matrix/04_tool_output/matrix/old_umi.mtx",
+        new=f"{SPATIAL_SOURCE_ROOT}/06_matrix/04_tool_output/matrix/new_umi.mtx",
+        molecules=f"{SPATIAL_SOURCE_ROOT}/05_molecule_call/01_tables/{SAMPLE}.molecule_calls.tsv.gz",
+        positions=f"{CELATLAS_BIN}/spatial/tissue_positions_list.csv"
+    output:
+        domains=f"{SAMPLE_ROOT}/07_spatial_dynamics/04_tool_output/scanpy/06_spatial_total_domains_{SPATIAL_BIN_LABEL}.tsv",
+        corrected=f"{SAMPLE_ROOT}/07_spatial_dynamics/04_tool_output/correction/{SAMPLE}.corrected_bin_gene_counts.tsv.gz",
+        marker=stage_marker("07", "spatial_dynamics")
+    log: f"{LOG_ROOT}/{SAMPLE}/07_spatial_dynamics.log"
+    benchmark: f"{LOG_ROOT}/{SAMPLE}/07_spatial_dynamics.benchmark.tsv"
+    threads: THREADS
+    resources: mem_mb=WORKFLOW_MEMORY_MB
+    shell:
+        "python3 pipeline/run_stage.py --config {RUN_CONFIG} --stage 07 > {log} 2>&1"
+
+
+rule tissue_bulk:
+    input:
+        prior=rules.spatial_dynamics.output.marker,
+        domains=rules.spatial_dynamics.output.domains,
+        corrected=rules.spatial_dynamics.output.corrected,
+        molecules=rules.molecule_call.output.molecules,
+        barcode=rules.barcode.output.table,
+        filtered=rules.barcode.output.filtered
+    output:
+        versions=f"{SAMPLE_ROOT}/08_tissue_bulk/05_metadata/software_versions.tsv",
+        mask=f"{SAMPLE_ROOT}/08_tissue_bulk/05_metadata/tissue_mask_qc.json",
+        marker=stage_marker("08", "tissue_bulk")
+    log: f"{LOG_ROOT}/{SAMPLE}/08_tissue_bulk.log"
+    benchmark: f"{LOG_ROOT}/{SAMPLE}/08_tissue_bulk.benchmark.tsv"
+    threads: THREADS
+    resources: mem_mb=65536
+    shell:
+        "python3 pipeline/run_stage.py --config {RUN_CONFIG} --stage 08 > {log} 2>&1"
+
+
+rule report:
+    input:
+        prior=rules.spatial_dynamics.output.marker,
+        bulk_marker=f"{BULK_SOURCE_ROOT}/08_tissue_bulk/05_metadata/stage_complete.json",
+        versions=f"{BULK_SOURCE_ROOT}/08_tissue_bulk/05_metadata/software_versions.tsv",
+        mask=f"{BULK_SOURCE_ROOT}/08_tissue_bulk/05_metadata/tissue_mask_qc.json",
+        domains=rules.spatial_dynamics.output.domains,
+        corrected=rules.spatial_dynamics.output.corrected
+    output:
+        report=f"{SAMPLE_ROOT}/09_report/{REPORT_FILENAME}",
+        manifest=f"{SAMPLE_ROOT}/09_report/05_metadata/delivery_manifest.tsv",
+        validation=f"{SAMPLE_ROOT}/09_report/05_metadata/report_validation.json",
+        marker=stage_marker("09", "report")
+    log: f"{LOG_ROOT}/{SAMPLE}/09_report.log"
+    benchmark: f"{LOG_ROOT}/{SAMPLE}/09_report.benchmark.tsv"
+    threads: 1
+    resources: mem_mb=16384
+    shell:
+        "python3 pipeline/run_stage.py --config {RUN_CONFIG} --stage 09 > {log} 2>&1"
